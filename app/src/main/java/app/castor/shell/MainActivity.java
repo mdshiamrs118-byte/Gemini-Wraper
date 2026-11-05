@@ -4,6 +4,8 @@ import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.DownloadManager;
+import android.content.ContentValues;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -17,6 +19,9 @@ import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
+import android.provider.MediaStore;
+import android.util.Base64;
 import android.text.InputType;
 import android.text.TextUtils;
 import android.util.TypedValue;
@@ -29,6 +34,8 @@ import android.view.animation.AccelerateInterpolator;
 import android.view.animation.DecelerateInterpolator;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
+import android.webkit.MimeTypeMap;
+import android.webkit.URLUtil;
 import android.webkit.PermissionRequest;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
@@ -59,6 +66,9 @@ import androidx.webkit.WebSettingsCompat;
 import androidx.webkit.WebViewCompat;
 import androidx.webkit.WebViewFeature;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.OutputStream;
 import java.util.Collections;
 import java.util.Locale;
 import java.util.function.Consumer;
@@ -67,7 +77,7 @@ import java.util.regex.Pattern;
 
 public class MainActivity extends Activity {
 
-    private static final String HOME = "https://gemini.google.com/app";
+    private static final String DEFAULT_HOME = "https://gemini.google.com/app";
     private static final Pattern INTERNAL = Pattern.compile(
             "(^|.*\\.)(google\\.[a-z]{2,3}(\\.[a-z]{2})?|youtube\\.com|gstatic\\.com|googleusercontent\\.com|googleapis\\.com)$");
     private static final int REQ_FILE = 11, REQ_MIC = 12;
@@ -186,7 +196,7 @@ public class MainActivity extends Activity {
         scrim.setOnClickListener(v -> setPanel(false));
         panel.setTranslationX(px(340));
 
-        String start = HOME;
+        String start = home();
         Uri d = getIntent().getData();
         if (d != null && "gemini.google.com".equals(d.getHost())) start = d.toString();
         openAccount(accounts.current(), start);
@@ -269,9 +279,7 @@ public class MainActivity extends Activity {
         w.setBackgroundColor(Color.TRANSPARENT);
         w.addJavascriptInterface(new Bridge(), "CastorBridge");
 
-        w.setDownloadListener((url, agent, cd, mime, len) -> {
-            try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))); } catch (Exception ignored) { }
-        });
+        w.setDownloadListener((url, agent, cd, mime, len) -> handleDownload(url, agent, cd, mime));
 
         w.setWebViewClient(new WebViewClient() {
             @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
@@ -364,6 +372,8 @@ public class MainActivity extends Activity {
         if (s == null) return true;
         if (s.equals("http") || s.equals("https")) {
             if (h != null && INTERNAL.matcher(h).matches()) return true;
+            String hh = homeHost();
+            if (h != null && hh != null && (h.equals(hh) || h.endsWith("." + hh))) return true;
         } else if (s.equals("about") || s.equals("blob") || s.equals("data") || s.equals("javascript")) {
             return true;
         }
@@ -373,6 +383,7 @@ public class MainActivity extends Activity {
 
     private final class Bridge {
         @JavascriptInterface public void atTop(boolean v) { atTop = v; }
+        @JavascriptInterface public void saveBlob(String dataUrl) { saveDataUrl(dataUrl); }
     }
 
     private void flushCookies() {
@@ -454,12 +465,22 @@ public class MainActivity extends Activity {
             panelList.addView(n);
         }
 
-        section("BROWSER");
-        panelList.addView(row(icon(R.drawable.ic_chat), "New chat", null, null, () -> go(HOME)), rowLp());
+        section("NAVIGATE");
+        panelList.addView(row(icon(R.drawable.ic_home), "Home", null, null, () -> go(home())), rowLp());
+        if (!prefs.getString("home", "").isEmpty()) {
+            panelList.addView(row(icon(R.drawable.ic_chat), "Open Gemini", null, null, () -> go(DEFAULT_HOME)), rowLp());
+        }
         panelList.addView(row(icon(R.drawable.ic_refresh), "Reload", null, null, () -> {
             if (web != null) web.reload();
             setPanel(false);
         }), rowLp());
+
+        section("SETTINGS");
+        String h = prefs.getString("home", "");
+        panelList.addView(row(icon(R.drawable.ic_link), "Home page",
+                h.isEmpty() ? "Gemini (default)" : h.replaceFirst("^https?://", ""), null, this::promptHome), rowLp());
+        panelList.addView(row(icon(R.drawable.ic_download), "Downloads",
+                prefs.getInt("dl", 0) == 0 ? "System download manager" : "Ask which app", null, this::chooseDownloader), rowLp());
         switchRow(R.drawable.ic_desktop, "Desktop site", desktop, on -> {
             desktop = on;
             prefs.edit().putBoolean("desktop", on).apply();
@@ -471,20 +492,183 @@ public class MainActivity extends Activity {
             prefs.edit().putBoolean("immersive", on).apply();
             applyBars();
         });
+
+        section("TOOLS");
+        panelList.addView(row(icon(R.drawable.ic_share), "Share link", null, null, () -> {
+            Intent i = new Intent(Intent.ACTION_SEND);
+            i.setType("text/plain");
+            i.putExtra(Intent.EXTRA_TEXT, currentUrl());
+            try { startActivity(Intent.createChooser(i, null)); } catch (Exception ignored) { }
+            setPanel(false);
+        }), rowLp());
         panelList.addView(row(icon(R.drawable.ic_open), "Open in browser", null, null, () -> {
-            String u = web != null && web.getUrl() != null ? web.getUrl() : HOME;
-            try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(u))); } catch (Exception ignored) { }
+            try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(currentUrl()))); } catch (Exception ignored) { }
+            setPanel(false);
+        }), rowLp());
+        panelList.addView(row(icon(R.drawable.ic_download), "Open downloads", null, null, () -> {
+            try { startActivity(new Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)); } catch (Exception ignored) { }
             setPanel(false);
         }), rowLp());
 
         section("STORAGE");
-        LinearLayout clear = row(icon(R.drawable.ic_delete), "Clear UI cache", fmt(cache.size()) + " saved", null, () -> {
+        panelList.addView(row(icon(R.drawable.ic_delete), "Clear UI cache", fmt(cache.size()) + " saved", null, () -> {
             cache.clear();
             if (web != null) web.clearCache(true);
             Toast.makeText(this, "UI cache cleared", Toast.LENGTH_SHORT).show();
             rebuildPanel();
-        });
-        panelList.addView(clear, rowLp());
+        }), rowLp());
+    }
+
+    /* ------------------------------------------------------------------ home page */
+
+    private String home() {
+        String h = prefs.getString("home", "");
+        return h.isEmpty() ? DEFAULT_HOME : h;
+    }
+
+    private String homeHost() {
+        String host = Uri.parse(home()).getHost();
+        if (host != null && host.startsWith("www.")) host = host.substring(4);
+        return host;
+    }
+
+    private String currentUrl() {
+        return web != null && web.getUrl() != null ? web.getUrl() : home();
+    }
+
+    private void promptHome() {
+        EditText et = new EditText(this);
+        et.setSingleLine(true);
+        et.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        et.setText(prefs.getString("home", ""));
+        et.setHint(DEFAULT_HOME);
+        FrameLayout box = new FrameLayout(this);
+        box.setPadding(px(24), px(8), px(24), 0);
+        box.addView(et);
+        new AlertDialog.Builder(this)
+                .setTitle("Home page")
+                .setMessage("The page the app opens. Leave empty to use Gemini.")
+                .setView(box)
+                .setPositiveButton("Save", (dlg, which) -> saveHome(et.getText().toString()))
+                .setNeutralButton("Current page", (dlg, which) -> saveHome(currentUrl()))
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void saveHome(String raw) {
+        String u = raw.trim();
+        if (!u.isEmpty()) {
+            if (!u.contains("://")) u = "https://" + u;
+            else if (u.startsWith("http://")) u = "https://" + u.substring(7);
+            if (Uri.parse(u).getHost() == null) {
+                Toast.makeText(this, "That doesn't look like a link", Toast.LENGTH_SHORT).show();
+                return;
+            }
+        }
+        if (u.equals(DEFAULT_HOME)) u = "";
+        prefs.edit().putString("home", u).apply();
+        Toast.makeText(this, u.isEmpty() ? "Home page: Gemini" : "Home page saved", Toast.LENGTH_SHORT).show();
+        rebuildPanel();
+    }
+
+    /* ------------------------------------------------------------------ downloads */
+
+    private void chooseDownloader() {
+        new AlertDialog.Builder(this)
+                .setTitle("Downloads")
+                .setSingleChoiceItems(new String[]{"System download manager", "Ask which app (1DM, ADM, browser...)"},
+                        prefs.getInt("dl", 0), (dlg, which) -> {
+                            prefs.edit().putInt("dl", which).apply();
+                            dlg.dismiss();
+                            rebuildPanel();
+                        })
+                .show();
+    }
+
+    private void handleDownload(String url, String agent, String cd, String mime) {
+        if (url.startsWith("data:")) {
+            new Thread(() -> saveDataUrl(url)).start();
+            return;
+        }
+        if (url.startsWith("blob:")) {
+            if (web != null) {
+                web.evaluateJavascript("(function(u){fetch(u).then(function(r){return r.blob()}).then(function(b){"
+                        + "var f=new FileReader();f.onloadend=function(){CastorBridge.saveBlob(String(f.result))};"
+                        + "f.readAsDataURL(b)})})('" + url.replace("'", "%27") + "')", null);
+            }
+            return;
+        }
+        if (prefs.getInt("dl", 0) == 1 || !(url.startsWith("http://") || url.startsWith("https://"))) {
+            externalDownload(url);
+            return;
+        }
+        try {
+            String name = URLUtil.guessFileName(url, cd, mime);
+            DownloadManager.Request r = new DownloadManager.Request(Uri.parse(url));
+            if (mime != null && !mime.isEmpty()) r.setMimeType(mime);
+            String cookie = cookieFor(url);
+            if (cookie != null) r.addRequestHeader("Cookie", cookie);
+            r.addRequestHeader("User-Agent", agent);
+            if (web != null && web.getUrl() != null) r.addRequestHeader("Referer", web.getUrl());
+            r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            if (Build.VERSION.SDK_INT >= 29) r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name);
+            else r.setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, name);
+            ((DownloadManager) getSystemService(DOWNLOAD_SERVICE)).enqueue(r);
+            Toast.makeText(this, "Downloading " + name, Toast.LENGTH_SHORT).show();
+        } catch (Exception e) {
+            externalDownload(url);
+        }
+    }
+
+    private void externalDownload(String url) {
+        try {
+            startActivity(Intent.createChooser(new Intent(Intent.ACTION_VIEW, Uri.parse(url)), "Download with"));
+        } catch (Exception e) {
+            Toast.makeText(this, "No app can open this link", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private String cookieFor(String url) {
+        try {
+            if (multiProfile) {
+                Profile p = ProfileStore.getInstance().getProfile(accounts.currentId());
+                if (p != null) return p.getCookieManager().getCookie(url);
+            }
+            return CookieManager.getInstance().getCookie(url);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** Saves a data: URL (also used for blob: URLs, which the page converts to data: first). */
+    private void saveDataUrl(String dataUrl) {
+        try {
+            int comma = dataUrl.indexOf(',');
+            String head = dataUrl.substring(5, comma);
+            String mime = head.split(";")[0];
+            if (mime.isEmpty()) mime = "application/octet-stream";
+            String body = dataUrl.substring(comma + 1);
+            byte[] bytes = head.contains(";base64")
+                    ? Base64.decode(body, Base64.DEFAULT)
+                    : Uri.decode(body).getBytes("UTF-8");
+            String ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mime);
+            String name = "castor_" + System.currentTimeMillis() + (ext != null ? "." + ext : "");
+            if (Build.VERSION.SDK_INT >= 29) {
+                ContentValues v = new ContentValues();
+                v.put(MediaStore.Downloads.DISPLAY_NAME, name);
+                v.put(MediaStore.Downloads.MIME_TYPE, mime);
+                v.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                Uri u = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                try (OutputStream o = getContentResolver().openOutputStream(u)) { o.write(bytes); }
+            } else {
+                File f = new File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), name);
+                try (FileOutputStream o = new FileOutputStream(f)) { o.write(bytes); }
+            }
+            final String shown = name;
+            runOnUiThread(() -> Toast.makeText(this, "Saved to Downloads: " + shown, Toast.LENGTH_LONG).show());
+        } catch (Exception e) {
+            runOnUiThread(() -> Toast.makeText(this, "Download failed", Toast.LENGTH_SHORT).show());
+        }
     }
 
     private void addAccountRow(Accounts.Account a) {
@@ -512,7 +696,7 @@ public class MainActivity extends Activity {
             trail = d;
         }
         LinearLayout r = row(av, a.name, active ? "Active" : null, trail, null);
-        if (!active) r.setOnClickListener(v -> { setPanel(false); openAccount(a, HOME); });
+        if (!active) r.setOnClickListener(v -> { setPanel(false); openAccount(a, home()); });
         panelList.addView(r, rowLp());
     }
 
@@ -531,7 +715,7 @@ public class MainActivity extends Activity {
                     String n = et.getText().toString().trim();
                     Accounts.Account a = accounts.add(n.isEmpty() ? "Account " + (accounts.size() + 1) : n);
                     setPanel(false);
-                    openAccount(a, HOME);
+                    openAccount(a, home());
                 })
                 .setNegativeButton("Cancel", null)
                 .show();
