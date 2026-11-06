@@ -118,6 +118,7 @@ public class MainActivity extends Activity {
     private View scrim, handleArea;
     private LinearLayout panel, panelList;
     private WebView web;
+    private WebView popup;
     private ValueCallback<Uri[]> fileCb;
     private PermissionRequest pendingPerm;
 
@@ -221,6 +222,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        closePopup();
         if (web != null) { webHost.removeView(web); web.destroy(); web = null; }
         super.onDestroy();
     }
@@ -234,13 +236,24 @@ public class MainActivity extends Activity {
     @Override
     public void onBackPressed() {
         if (panelOpen) setPanel(false);
+        else if (popup != null) { if (popup.canGoBack()) popup.goBack(); else closePopup(); }
         else if (web != null && web.canGoBack()) web.goBack();
         else super.onBackPressed();
     }
 
     /* ------------------------------------------------------------------ WebView */
 
+    private void closePopup() {
+        if (popup != null) {
+            webHost.removeView(popup);
+            popup.destroy();
+            popup = null;
+            swipe.setEnabled(true);
+        }
+    }
+
     private void openAccount(Accounts.Account a, String url) {
+        closePopup();
         if (web != null) { webHost.removeView(web); web.destroy(); web = null; }
         WebView w = new WebView(this);
         if (multiProfile) {
@@ -268,6 +281,8 @@ public class MainActivity extends Activity {
         s.setDomStorageEnabled(true);
         s.setCacheMode(WebSettings.LOAD_DEFAULT);
         s.setMediaPlaybackRequiresUserGesture(true);
+        s.setSupportMultipleWindows(true);
+        s.setJavaScriptCanOpenWindowsAutomatically(true);
         s.setAllowFileAccess(false);
         s.setAllowContentAccess(false);
         applyViewMode(s);
@@ -284,7 +299,12 @@ public class MainActivity extends Activity {
         w.setWebViewClient(new WebViewClient() {
             @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
                 if (!r.isForMainFrame()) return false;
-                return !openInApp(r.getUrl());
+                Uri u = r.getUrl();
+                // Redirects and script-driven navigation (login flows) always stay in the app.
+                if ((r.isRedirect() || !r.hasGesture()) && "https".equals(u.getScheme())) return false;
+                boolean inApp = openInApp(u);
+                if (!inApp && v == popup) closePopup();
+                return !inApp;
             }
             @Override public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) {
                 return cache.handle(r, ua);
@@ -297,7 +317,7 @@ public class MainActivity extends Activity {
             @Override public void onPageFinished(WebView v, String url) {
                 progress.setVisibility(View.GONE);
                 swipe.setRefreshing(false);
-                v.evaluateJavascript(SCROLL_JS, null);
+                if (v == web) v.evaluateJavascript(SCROLL_JS, null);
             }
             @Override public void onReceivedError(WebView v, WebResourceRequest r, WebResourceError e) {
                 if (!r.isForMainFrame()) return;
@@ -309,6 +329,28 @@ public class MainActivity extends Activity {
 
         w.setWebChromeClient(new WebChromeClient() {
             @Override public void onProgressChanged(WebView v, int p) { progress.setProgress(Math.max(p, 8)); }
+
+            // window.open(): used by "Continue with Google" and similar popup logins.
+            @Override public boolean onCreateWindow(WebView v, boolean dialog, boolean gesture, android.os.Message msg) {
+                closePopup();
+                WebView p = new WebView(MainActivity.this);
+                if (multiProfile) {
+                    try { WebViewCompat.setProfile(p, accounts.currentId()); } catch (Exception ignored) { }
+                }
+                configure(p);
+                p.setBackgroundColor(getResources().getColor(R.color.bg, getTheme()));
+                webHost.addView(p, new FrameLayout.LayoutParams(-1, -1));
+                popup = p;
+                swipe.setEnabled(false);
+                WebView.WebViewTransport t = (WebView.WebViewTransport) msg.obj;
+                t.setWebView(p);
+                msg.sendToTarget();
+                return true;
+            }
+
+            @Override public void onCloseWindow(WebView window) {
+                if (window == popup) closePopup();
+            }
 
             @Override public boolean onShowFileChooser(WebView v, ValueCallback<Uri[]> cb, FileChooserParams p) {
                 if (fileCb != null) fileCb.onReceiveValue(null);
